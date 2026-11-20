@@ -1,0 +1,515 @@
+---
+title: "Lab 6 ordinal regression"
+author: "Wanying Lu"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-summary: "Show code"
+    df-print: paged
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)   # dplyr for data manipulation and ggplot2 for plotting
+library(psych)       # scoreItems() for scoring the Big Five subscales
+library(ordinal)     # clm() for cumulative logit models and nominal_test()
+library(readxl)      # read_excel() for loading the .xlsx data file
+library(ggeffects)   # ggpredict() for predicted category probabilities
+library(broom)       # tidy() for pulling coefficients out of the model
+library(gt)          # gt() for formatted tables
+
+fmt_p <- function(p) if (p < .001) "< .001" else paste0("= ", sprintf("%.3f", p))
+```
+
+# 1. Question and predictions
+
+The `bfi` data contain 25 personality items answered by 2800 people, five items for each of the Big Five traits. Each item is answered on a six-point scale running from *Very inaccurate* to *Very accurate*.
+
+My ordered outcome is the Neuroticism item **N4, "Often feel blue."** The item is not reverse-keyed, so a higher response means the person judges the statement to be a more accurate description of themselves. 
+
+I predict that people who score higher on Extraversion will be **less** likely to endorse N4. I expect responses to shift toward the *inaccurate* categories as Extraversion rises.
+
+## Load the data
+
+```{r}
+#| label: load-data
+
+bfi_raw <- read_excel("bfi.xlsx")   # read the file from the project folder; a relative path keeps the analysis reproducible
+
+bfi_raw <- bfi_raw |>               # take the raw data and overwrite it with a cleaned version
+  mutate(across(2:26, as.integer))  # columns 2 to 26 are the 25 personality items; force them to integers because missing values are stored as the text "NA"
+
+```
+
+## Prepare the analysis data
+
+```{r}
+#| label: prepare-data
+
+# The six response options, written from lowest to highest so the factor levels
+# match the numeric codes 1 to 6.
+n_levels <- c("Very inaccurate", "Moderately inaccurate", "Slightly inaccurate",
+              "Slightly accurate", "Moderately accurate", "Very accurate")
+
+# Scoring keys for the five subscales. A minus sign marks a reverse-keyed item,
+# which scoreItems() flips before averaging.
+keys <- list(
+  Agreeableness     = c("-A1", "A2", "A3", "A4", "A5"),
+  Conscientiousness = c("C1", "C2", "C3", "-C4", "-C5"),
+  Extraversion      = c("-E1", "-E2", "E3", "E4", "E5"),
+  Neuroticism       = c("N1", "N2", "N3", "N4", "N5"),
+  Openness          = c("O1", "-O2", "O3", "O4", "-O5")
+)
+
+scores <- scoreItems(keys, bfi_raw, totals = FALSE, min = 1, max = 6)  # totals = FALSE returns subscale means rather than sums; min and max tell it the response range so reverse keying is correct
+
+scores_df <- scores$scores        # pull out the matrix of five subscale scores, one column per trait
+
+dat <- bfi_raw |>                 # start from the cleaned raw data
+  select(N4) |>                   # keep only the outcome item; the predictor comes from the scores matrix
+  bind_cols(as_tibble(scores_df)) |>                                   # attach the five subscale score columns beside it
+  mutate(
+    N4 = factor(N4, levels = 1:6, labels = n_levels, ordered = TRUE),  # turn the outcome into an ordered factor so clm() knows the categories have a direction
+    highest = factor(names(keys)[max.col(scores_df, ties.method = "first")]),  # unordered outcome: the trait each person scored highest on, with ties going to the first trait
+    extra = Extraversion                                               # short, readable name for the predictor
+  ) |>
+  drop_na(N4, extra, highest) |>  # remove cases missing the outcome, the predictor, or the dominant trait
+  mutate(extra_c = extra - mean(extra))  # centre the predictor after dropping missing cases, so the mean is the mean of the analysed sample
+
+extra_bar  <- mean(dat$extra)     # save the uncentred mean for inline reporting and for putting plots back on the raw scale
+n_analysed <- nrow(dat)           # save the analysed N for inline reporting
+```
+
+I analysed **N = `r format(n_analysed, big.mark = ",")`** cases, which are the respondents with complete data on N4, the Extraversion subscale, and the dominant-trait variable. The predictor was scored as the mean of the five Extraversion items on the original one-to-six metric, with E1 and E2 reverse-keyed, so it stays on the same scale as the items. Its mean before centring was **`r round(extra_bar, 2)`**.
+
+# 2. Examine the outcomes
+
+## 2.1 The ordered outcome
+
+```{r}
+#| label: n4-counts
+
+n4_counts <- dat |>               # start from the analysis data
+  count(N4) |>                    # count how many people chose each of the six options
+  mutate(p = n / sum(n))          # p is the proportion of the sample in each category, P(Y = j)
+
+n4_counts |>                      # take that table
+  gt() |>                         # render it as a formatted table
+  cols_label(N4 = "Category (j)", n = "n", p = "P(Y = j)") |>  # give the columns readable headers
+  fmt_number(columns = p, decimals = 3)                        # show the proportions to three decimals
+```
+
+```{r}
+#| label: fig-n4-bar
+#| fig-cap: "Responses to N4, 'Often feel blue', in their natural order."
+
+plot_n4 <- ggplot(n4_counts, aes(x = N4, y = n, fill = N4)) +  # map the six categories to x and their counts to y
+  geom_col(width = 0.7) +                                      # draw one bar per category
+  scale_x_discrete(labels = scales::label_wrap(12)) +          # wrap the long category labels so they do not overlap
+  labs(title = "Six ordered categories: 'Often feel blue'",    # add a title
+       x = NULL, y = "People") +                               # the x axis needs no label; name the y axis
+  theme_minimal() +                                            # use a clean theme
+  theme(legend.position = "none")                              # the fill colours repeat the x axis, so drop the legend
+
+plot_n4                                                        # print the bar chart
+```
+
+No category is empty or sparse. The smallest category has `r min(n4_counts$n)` responses, so every threshold can be estimated and I did not collapse any categories.
+
+## 2.2 How the predictor relates to the outcome
+
+```{r}
+#| label: fig-jitter
+#| fig-cap: "Extraversion against responses to N4, with points jittered to show overlap."
+
+plot_jitter <- ggplot(dat, aes(extra, as.numeric(N4), colour = N4)) +  # predictor on x; the outcome as a number on y so points can be spread vertically
+  geom_jitter(width = 0.05, height = 0.15, alpha = 0.25, size = 1.4) + # nudge overlapping points apart; the transparency makes density visible
+  scale_y_continuous(breaks = 1:6, labels = n_levels) +                # relabel the numeric y axis with the six response options
+  labs(title = "Extraversion and responses to 'Often feel blue'",      # add a title
+       x = "Extraversion (subscale mean, 1-6)", y = NULL) +            # name the x axis
+  theme_minimal() +                                                    # clean theme
+  theme(legend.position = "none")                                      # the colour repeats the y axis, so drop the legend
+
+plot_jitter                                                            # print the jittered dot plot
+```
+
+The plot is consistent with a negative association, although the overlap is heavy. Points at the low end of Extraversion spread across the whole scale, and the densest clumps in the two inaccurate categories sit toward the high end. 
+
+The spacing between the options is also unknown, so a single value such as 3.4 would treat every step as equal, and no respondent can give that answer. A single value hides the shape of the responses too. The overlap shows that Extraversion does not fix a person’s answer, it only shifts the chances, so the model should return a probability for each category.
+
+## 2.3 An unordered outcome
+
+```{r}
+#| label: fig-highest
+#| fig-cap: "Dominant trait, the trait on which each person scored highest."
+
+highest_counts <- dat |>          # start from the analysis data
+  count(highest) |>               # count how many people have each trait as their highest
+  mutate(highest = fct_reorder(highest, n))  # reorder the bars by size for readability
+
+plot_highest <- ggplot(highest_counts, aes(highest, n)) +  # trait on x, count on y
+  geom_col(width = 0.65, fill = "#2C7FB8") +               # draw the bars in one colour, because the categories have no order
+  coord_flip() +                                           # flip to horizontal bars so the trait names are readable
+  labs(title = "Dominant trait: five categories with no order",
+       x = NULL, y = "People") +                           # name the count axis
+  theme_minimal()                                          # clean theme
+
+plot_highest                                               # print the bar chart
+```
+
+This variable is unordered because its five categories cannot be placed on a single scale. Scoring highest on Openness is not "more" of anything than scoring highest on Agreeableness, and the two cannot be said to sit above or below each other. The bars are therefore sorted by size for readability only, and that ordering carries no meaning. 
+
+# 3. Cumulative probabilities
+
+## 3.1 The cumulative table
+
+```{r}
+#| label: cumulative-table
+
+obs_tab <- dat |>                 # start from the analysis data
+  count(N4) |>                    # one row per category with its count
+  mutate(
+    Probability = n / sum(n),                            # P(Y = j), the share of the sample in this category
+    CumulativeProbability = cumsum(Probability),         # P(Y <= j); cumsum() is a running total down the ordered categories
+    CumulativeOdds = if_else(CumulativeProbability < 1,  # odds of being at or below category j
+                             CumulativeProbability / (1 - CumulativeProbability),
+                             NA_real_),                  # undefined at the top category, where the denominator is zero
+    Cumulative_Logodds = if_else(CumulativeProbability < 1,
+                                 qlogis(CumulativeProbability),  # qlogis() converts a probability into log-odds
+                                 NA_real_)               # also undefined at the top category
+  )
+
+obs_tab |>                        # take the cumulative table
+  gt() |>                         # format it
+  cols_label(
+    N4 = "Category j", n = "n", Probability = "P(Y = j)",
+    CumulativeProbability = "P(Y ≤ j)",
+    CumulativeOdds = "Odds of ≤ j",
+    Cumulative_Logodds = "Log-odds of ≤ j"
+  ) |>
+  fmt_number(columns = c(Probability, CumulativeProbability), decimals = 3) |>
+  fmt_number(columns = c(CumulativeOdds, Cumulative_Logodds), decimals = 2) |>
+  sub_missing(missing_text = "—")                   # print a dash where the top-category values are undefined
+```
+
+## 3.2 Why five cumulative probabilities, and why the last odds are undefined
+
+A cumulative probability is the probability that an answer falls in category j or any category below it. Each one cuts the six-point scale into two groups: at or below j on one side, above j on the other. This turns an ordered outcome into a yes/no contrast, and a logit link can model that kind of contrast.
+
+Six categories give only five cuts. The sixth cut would put every category on one side. P(Y ≤ Very accurate) is always 1, so it tells us nothing, and nothing is left to estimate.
+
+The odds for the top category fail for the same reason. The odds are P(Y ≤ j) divided by P(Y > j). At the top category the bottom of that fraction is 0, so we cannot divide. The log-odds fail too, because qlogis(1) returns infinity in R. The cumulative model therefore estimates five thresholds, not six.
+
+# 4. Specify and estimate the models
+
+## 4.1 Why an ordinal model suits this outcome
+
+My outcome is a single Likert item with six ordered answer options. The order matters, because *Moderately accurate* really sits above *Slightly accurate*, but the spacing between options is unknown and there is no reason to treat the six steps as equal in size. 
+
+A cumulative logit model uses only the ordering. It models the probability of answering at or below each threshold, which respects the sequence of the categories, and it returns a probability for each category instead of a single fitted value.
+
+## 4.2 Two nested models
+
+```{r}
+#| label: fit-models
+
+M0 <- clm(N4 ~ 1, data = dat)        # null model: five thresholds, no predictor
+M1 <- clm(N4 ~ extra_c, data = dat)  # one-predictor model: the same thresholds plus one shared slope for centred Extraversion
+
+summary(M1)                          # print the thresholds and the slope with standard errors and p-values
+```
+
+```{r}
+#| label: model-parts
+
+coef(M1)                             # every estimate in the model: the five thresholds first, then the slope
+
+b  <- coef(M1)[["extra_c"]]          # pull the slope out by name
+th <- coef(M1)[1:5]                  # the first five estimates are the thresholds
+```
+
+## 4.3 Interpreting the thresholds
+
+```{r}
+#| label: threshold-table
+
+cum_avg <- plogis(th)                # plogis() turns each threshold into P(Y <= j) for a person at the mean of Extraversion
+
+cat_p <- diff(c(0, cum_avg, 1))      # differencing the cumulative probabilities gives P(Y = j) for each of the six categories
+
+tibble(
+  Category = n_levels,               # the six response options in order
+  theta = c(th, NA),                 # the five thresholds; the top category has no threshold above it
+  cum = c(cum_avg, 1),               # cumulative probability, which reaches 1 at the top category
+  cat_p = cat_p                      # category probability
+) |>
+  gt() |>
+  cols_label(theta = "Threshold above category",
+             cum = "P(Y ≤ j)",
+             cat_p = "P(Y = j)") |>
+  fmt_number(columns = theta, decimals = 2) |>
+  fmt_number(columns = c(cum, cat_p), decimals = 2) |>
+  sub_missing(missing_text = "—")
+```
+
+Centring makes the thresholds interpretable. On the raw metric the thresholds would describe someone scoring 0 on Extraversion, which is impossible on a one-to-six scale. 
+
+After centring, the predictor is zero at the sample mean of 4.14, so the thresholds describe a person of average Extraversion. Centring shifts all five thresholds by the same amount and leaves the slope unchanged. Subtracting a constant moves where zero sits on the predictor, and the thresholds are defined at zero, but it does not change what one point of Extraversion means.
+
+For a person of average Extraversion, the most likely single response is *`r n_levels[which.max(cat_p)]`*, with probability `r round(max(cat_p), 2)`. The probability that such a person endorses the item at all, meaning *Slightly accurate* or higher, is `r round(1 - cum_avg[3], 2)`.
+
+## 4.4 Checking the null model
+
+```{r}
+#| label: null-check
+
+coef(M0)                             # the thresholds of the null model
+obs_tab$Cumulative_Logodds[1:5]      # the observed cumulative log-odds from Part 3
+```
+
+The two sets of numbers match. With no predictor in the model there is nothing for the thresholds to be conditional on, so they simply reproduce the cumulative log-odds of the observed response distribution. Once Extraversion enters the model the thresholds become conditional on it, and they then describe a person of average Extraversion rather than the sample as a whole, which is why they no longer match the raw proportions.
+
+# 5. Compare and select a model
+
+## 5.1 Model comparison
+
+```{r}
+#| label: lrt
+
+lrt <- anova(M0, M1)                 # likelihood ratio test comparing the two nested models
+lrt                                  # print the test table
+
+lr_stat <- lrt$LR.stat[2]            # the chi-square statistic sits in row 2 of the table
+lr_df   <- lrt$df[2]                 # its degrees of freedom
+lr_p    <- lrt$`Pr(>Chisq)`[2]       # its p-value; backticks are needed because the column name contains symbols
+```
+
+```{r}
+#| label: aic-table
+
+tibble(
+  Model = c("M0: Null", "M1: Extraversion"),
+  Parameters = c(length(coef(M0)), length(coef(M1))),   # count the estimated parameters in each model
+  logLik = c(logLik(M0), logLik(M1)),                   # log-likelihood of each fit
+  AIC = c(AIC(M0), AIC(M1))                             # AIC of each fit
+) |>
+  mutate(`ΔAIC` = AIC - min(AIC)) |>               # difference from the best model, so the preferred model shows 0
+  gt() |>
+  fmt_number(columns = c(logLik, AIC, `ΔAIC`), decimals = 1)
+
+d_aic <- AIC(M0) - AIC(M1)           # save the AIC improvement for inline reporting
+```
+
+Adding Extraversion improved fit over the null model, χ²(`r lr_df`) = `r round(lr_stat, 2)`, *p* `r fmt_p(lr_p)`, with ΔAIC = `r round(d_aic, 1)`.
+
+I therefore select **M1** as the working model. 
+
+## 5.2 The slope on the latent scale
+
+```{r}
+#| label: latent-scale
+
+mid_width <- mean(diff(th)[2:3])     # average width of the middle categories: the gaps between thresholds 2-3 and 3-4
+```
+
+The slope is β = `r round(b, 3)` on the latent logit scale. A one-point rise in Extraversion moves a person `r round(abs(b), 2)` units down that latent continuum, which I read as a shift away from endorsing the item. The size is easier to judge against the width of a category. The middle categories are about `r round(mid_width, 2)` units wide, so one point of Extraversion moves a person roughly `r round(100 * abs(b) / mid_width)`% of one category. A one-point difference in Extraversion is therefore a modest shift rather than a change of category, although differences of two or three points would accumulate.
+
+# 6. Check the proportional odds assumption
+
+## 6.1 The test
+
+```{r}
+#| label: nominal-test
+
+nt <- nominal_test(M1)               # refit with a separate slope at each threshold, then compare the two models with an LRT
+nt                                   # print the test table
+
+nt_lrt <- nt["extra_c", "LRT"]       # the LRT statistic for the predictor, pulled out by row and column name
+nt_df  <- nt["extra_c", "Df"]        # its degrees of freedom
+nt_p   <- nt["extra_c", "Pr(>Chi)"]  # its p-value
+```
+
+M1 uses one slope for all five thresholds. That is the **proportional odds assumption**.
+
+`nominal_test()` checks it. It refits the model so that Extraversion gets its own slope at each threshold, which means a different push at each gap. It then compares the two models with a likelihood ratio test. If five slopes do not fit better than one, a single slope is enough.
+
+The test gave χ²(`r nt_df`) = `r round(nt_lrt, 2)`, *p* `r fmt_p(nt_p)`.
+
+The test is not significant, so one slope is enough and I keep M1. With a sample this size the test has plenty of power to catch a real difference, so I read this as no sign of a problem rather than proof that the assumption is exactly true.
+
+## 6.2 The threshold-specific model
+
+```{r}
+#| label: nominal-model
+
+# This model is fitted whether or not the test above was significant, because
+# Part 7.4 needs its five threshold-specific odds ratios for the coefficient plot.
+M_nom <- clm(N4 ~ 1, nominal = ~ extra_c, data = dat)  # thresholds plus one Extraversion effect per threshold
+
+anova(M1, M_nom)                     # compare the shared-slope model with the threshold-specific one
+```
+
+```{r}
+#| label: threshold-or
+
+coef(M_nom)                                    # estimates 1 to 5 are thresholds; 6 to 10 are the five threshold-specific effects
+
+nom_est <- coef(M_nom)[6:10]                   # the five threshold-specific effects
+nom_se  <- sqrt(diag(vcov(M_nom)))[6:10]       # their standard errors: vcov() gives the covariance matrix, diag() its variances, sqrt() the standard errors
+
+# Nominal effects shift the thresholds, so their sign is the opposite of a
+# location coefficient. I flip the sign before exponentiating, so that each odds
+# ratio describes responding ABOVE the threshold.
+threshold_or <- tibble(
+  Threshold = c("Very inaccurate | Moderately inaccurate",
+                "Moderately inaccurate | Slightly inaccurate",
+                "Slightly inaccurate | Slightly accurate",
+                "Slightly accurate | Moderately accurate",
+                "Moderately accurate | Very accurate"),
+  Estimate = nom_est,                          # the raw threshold-specific effect
+  SE = nom_se,                                 # its standard error
+  OR = exp(-Estimate),                         # flip the sign, then exponentiate, to get the odds ratio for responding above the threshold
+  low = exp(-(Estimate + 1.96 * SE)),          # lower 95% confidence limit; flipping the sign swaps which limit is which
+  high = exp(-(Estimate - 1.96 * SE))          # upper 95% confidence limit
+)
+
+threshold_or |>
+  gt() |>
+  fmt_number(columns = c(Estimate, SE), decimals = 3) |>
+  fmt_number(columns = c(OR, low, high), decimals = 3)
+```
+
+The assumption held, so this is not my main model. I fit it for two reasons. It shows what I would have reported if the test had failed. Its five odds ratios also give the plot in Part 7.4 something to compare the shared estimate against.
+
+# 7. Interpret the results
+
+## 7.1 The cumulative odds ratio
+
+```{r}
+#| label: odds-ratio
+
+or_tab <- tidy(M1, conf.int = TRUE, exponentiate = TRUE) |>  # tidy() makes a data frame of estimates; exponentiate gives odds ratios and conf.int adds 95% intervals
+  filter(coef.type == "location")                            # keep the slope and drop the five thresholds
+
+or_tab |>
+  gt() |>
+  fmt_number(columns = c(estimate, std.error, statistic, conf.low, conf.high), decimals = 3)
+```
+
+For Extraversion, e^β = `r round(or_tab$estimate, 3)`, 95% CI [`r round(or_tab$conf.low, 3)`, `r round(or_tab$conf.high, 3)`], *p* `r fmt_p(or_tab$p.value)`.
+
+One more point of Extraversion multiplies the odds of answering above any threshold by `r round(or_tab$estimate, 2)`. That is a **`r round(100 * (1 - or_tab$estimate))`% drop** in those odds.
+
+In plain terms: people who are one point more extraverted are less likely to say that "Often feel blue" describes them. The same multiplier applies at every cut point on the scale.
+
+## 7.2 From odds ratio to probabilities
+
+An odds ratio is easy to misread. It is not a number of categories, and it is not a ratio of probabilities. So it helps to turn it into probabilities.
+
+The table uses the third threshold, between *Slightly inaccurate* and *Slightly accurate*. The probability it reports is therefore the probability of endorsing the item at all.
+
+```{r}
+#| label: prob-table
+
+# clm() models the log-odds of being AT OR BELOW a threshold as theta - b * x_c,
+# so I subtract the mean from each raw score before applying the slope.
+prob_at <- function(x) {                       # define the calculation once rather than four times
+  logodds <- th[3] - b * (x - extra_bar)       # log-odds of being at or below threshold 3 at raw Extraversion score x
+  1 - plogis(logodds)                          # plogis() gives P(at or below); one minus that is P(above), which is endorsement
+}
+
+prob_tab <- tibble(
+  Extraversion = c(2, 3, 4, 5, 6),             # five values spanning the observed range of the predictor
+  Prob = prob_at(Extraversion),                # predicted probability of endorsing the item at each value
+  Odds = Prob / (1 - Prob)                     # the matching odds, so the constant multiplicative step becomes visible
+)
+
+prob_tab |>
+  gt() |>
+  cols_label(Prob = "P(Slightly accurate or higher)") |>
+  fmt_number(columns = c(Prob, Odds), decimals = 3)
+```
+
+```{r}
+#| label: prob-checks
+
+prob_tab$Odds[-1] / prob_tab$Odds[-5]          # each ratio of consecutive odds equals the odds ratio
+diff(prob_tab$Prob)                            # the probability changes are not equal across steps
+```
+
+The odds change by the same factor at every step. Each ratio of neighbouring odds equals `r round(prob_tab$Odds[2] / prob_tab$Odds[1], 3)`, which is the odds ratio from Part 7.1. It is the same whether the step runs from 2 to 3 or from 5 to 6.
+
+The probability behaves differently. It drops by `r round(prob_tab$Prob[1] - prob_tab$Prob[2], 3)` from Extraversion 2 to 3, but by only `r round(prob_tab$Prob[4] - prob_tab$Prob[5], 3)` from 5 to 6.
+
+The reason is that log-odds and probability are not linked in a straight line. A constant change in the odds moves the probability most when the probability is near 0.5, and much less once it gets close to 0 or 1. So the same odds ratio means different probability changes depending on where a person starts. That is why I also plot the predicted probabilities.
+
+## 7.3 Predicted category probabilities
+
+```{r}
+#| label: fig-stacked
+#| fig-cap: "Predicted probability of each response to N4 across the range of Extraversion."
+
+pred <- ggpredict(M1, terms = "extra_c [all]")  # one predicted probability per predictor value and response category
+
+pred_df <- as.data.frame(pred)                  # convert to a plain data frame so dplyr can work on it
+
+rl <- as.character(pred_df$response.level)      # the category label ggpredict attached to each row
+if (all(rl %in% n_levels)) {                    # case 1: ggeffects returned the full response wording
+  pred_df$response.level <- factor(rl, levels = n_levels)                      # fix the order to the natural scale order, lowest to highest
+} else {                                        # case 2: ggeffects returned codes such as "1" to "6"
+  pred_df$response.level <- factor(rl, levels = sort(unique(rl)), labels = n_levels)  # sort the codes, then attach the wording in order
+}
+
+pred_df |>
+  mutate(extra = x + extra_bar) |>              # put the predictor back on its original uncentred scale
+  ggplot(aes(extra, predicted, fill = response.level)) +  # predictor on x, predicted probability on y, one band per category
+  geom_area(position = "stack") +                         # stack the six bands so they sum to 1 at every value of x
+  scale_y_continuous(labels = scales::percent) +          # show the y axis as percentages
+  guides(fill = guide_legend(nrow = 2)) +                 # put the legend on two rows so it fits
+  labs(title = "Predicted probability of each response to 'Often feel blue'",
+       x = "Extraversion (subscale mean)", y = "Predicted probability", fill = NULL) +
+  theme_minimal()
+```
+
+The picture shifts steadily as Extraversion rises. At the low end a large share of the probability sits in the *accurate* categories, so endorsing the item is common there. As Extraversion goes up, that share shrinks and the probability moves into *Moderately inaccurate* and *Very inaccurate*.
+
+The shift is gradual, not sudden, which is what one shared slope implies. At every value of Extraversion the six probabilities add up to 1, so the stack always reaches 100%.
+
+## 7.4 Coefficient plot of the odds ratios
+
+```{r}
+#| label: fig-or
+#| fig-cap: "Shared and threshold-specific cumulative odds ratios per point of Extraversion."
+
+bind_rows(
+  tibble(Threshold = "Shared (proportional odds)",               # one row for the single shared odds ratio from M1
+         OR = or_tab$estimate, low = or_tab$conf.low, high = or_tab$conf.high,
+         type = "Shared"),
+  threshold_or |> transmute(Threshold, OR, low, high, type = "Threshold-specific")  # five rows for the threshold-specific odds ratios
+) |>
+  mutate(Threshold = fct_rev(fct_inorder(Threshold))) |>         # keep the rows in the order written, reading top to bottom
+  ggplot(aes(OR, Threshold, colour = type)) +                    # odds ratio on x, cut point on y, colour separating the two kinds
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +  # reference line at OR = 1, which means no effect
+  geom_pointrange(aes(xmin = low, xmax = high)) +                # point estimate with its 95% confidence interval
+  labs(title = "Cumulative odds ratios per point of Extraversion",
+       x = "Odds ratio (responding above the threshold)", y = NULL, colour = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Every interval sits below the dashed line at 1. So at each cut point, higher Extraversion goes with lower odds of answering above that cut point.
+
+The five threshold-specific estimates also sit close to the shared estimate, and their intervals overlap it. That is the pattern proportional odds implies. The plot is a visual companion to the test in Part 6, not separate evidence.
+
+# 8. Results
+
+I fitted a cumulative logit model with proportional odds. The outcome was the Neuroticism item N4, "Often feel blue," and the predictor was mean-centred Extraversion (*N* = `r format(n_analysed, big.mark = ",")`). I treated the outcome as an ordered factor with six categories, running from *Very inaccurate* to *Very accurate*. No category was sparse, the smallest held `r min(n4_counts$n)` responses, so I collapsed none of them. The predictor was the mean of the five Extraversion items with E1 and E2 reverse-keyed, and its mean before centring was `r round(extra_bar, 2)`. Adding Extraversion improved fit over a thresholds-only null model, χ²(`r lr_df`) = `r round(lr_stat, 2)`, *p* `r fmt_p(lr_p)`, with ΔAIC = `r round(d_aic, 1)` in favour of the one-predictor model, so I kept it.
+
+As predicted, people higher in Extraversion were less likely to endorse the item, OR = `r round(or_tab$estimate, 2)`, 95% CI [`r round(or_tab$conf.low, 2)`, `r round(or_tab$conf.high, 2)`], *p* `r fmt_p(or_tab$p.value)`. Each one-point rise in Extraversion lowered the odds of a higher response by about `r round(100 * (1 - or_tab$estimate))`%. The proportional odds assumption held, χ²(`r nt_df`) = `r round(nt_lrt, 2)`, *p* `r fmt_p(nt_p)`, so I did not need a partial proportional-odds model and I report the shared slope. In probability terms, the chance of endorsing the item fell from `r round(prob_tab$Prob[1], 2)` at an Extraversion score of 2 to `r round(prob_tab$Prob[5], 2)` at a score of 6 (@fig-stacked). My prediction from Part 1 was supported in this sample: higher Extraversion went with lower endorsement of "Often feel blue."
